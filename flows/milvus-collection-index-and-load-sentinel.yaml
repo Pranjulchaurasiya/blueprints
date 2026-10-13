@@ -1,0 +1,253 @@
+id: milvus-collection-index-and-load-sentinel
+namespace: company.ai
+
+inputs:
+  - id: milvus_host
+    type: STRING
+    required: true
+    defaults: "milvus.internal.company.com"
+    description: "Milvus standalone or distributed proxy hostname / VIP"
+
+  - id: milvus_port
+    type: INT
+    required: true
+    defaults: 19530
+    description: "Milvus HTTP REST API port (default: 19530)"
+
+  - id: alert_on_unindexed
+    type: BOOLEAN
+    required: true
+    defaults: true
+    description: "Trigger alerts if collections contain vectors without an active index"
+
+  - id: slack_channel
+    type: STRING
+    required: true
+    defaults: "#ai-platform-alerts"
+    description: "Destination Slack channel for Milvus vector database health alerts"
+
+triggers:
+  - id: periodic_vector_index_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 */2 * * *"
+
+tasks:
+  - id: audit_milvus_collections
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Queries Milvus v2 REST API to inspect collection schemas, vector indexing status, and memory load states"
+    containerImage: python:3.11-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install kestra
+    env:
+      MILVUS_HOST: "{{ inputs.milvus_host }}"
+      MILVUS_PORT: "{{ inputs.milvus_port }}"
+      MILVUS_TOKEN: "{{ secret('MILVUS_TOKEN') }}"
+      ALERT_UNINDEXED: "{{ inputs.alert_on_unindexed }}"
+    script: |
+      import os
+      import sys
+      import json
+      import urllib.request
+      import urllib.error
+      from kestra import Kestra
+
+      host = os.environ.get("MILVUS_HOST", "localhost")
+      port = int(os.environ.get("MILVUS_PORT", 19530))
+      token = os.environ.get("MILVUS_TOKEN", "")
+      alert_unindexed = os.environ.get("ALERT_UNINDEXED", "true").lower() == "true"
+
+      base_url = f"http://{host}:{port}/v2/vectordb"
+      headers = {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+      }
+      if token:
+          headers["Authorization"] = f"Bearer {token}"
+
+      def post_json(path, payload):
+          url = f"{base_url}{path}"
+          data = json.dumps(payload).encode("utf-8")
+          req = urllib.request.Request(url, data=data, headers=headers)
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              return json.loads(resp.read().decode("utf-8"))
+
+      # List all collections
+      list_resp = post_json("/collections/list", {})
+      collection_names = list_resp.get("data", [])
+      total_collections = len(collection_names)
+
+      unloaded_collections = []
+      unindexed_collections = []
+      collection_reports = []
+
+      for name in collection_names:
+          desc_resp = post_json("/collections/describe", {"collectionName": name})
+          cdata = desc_resp.get("data", {})
+          load_state = cdata.get("load", "Unknown")
+          indexes = cdata.get("indexes", [])
+
+          has_vector_index = len(indexes) > 0
+
+          if load_state != "Loaded":
+              unloaded_collections.append(f"{name} (state: {load_state})")
+
+          if not has_vector_index and alert_unindexed:
+              unindexed_collections.append(name)
+
+          collection_reports.append({
+              "name": name,
+              "load_state": load_state,
+              "indexes_count": len(indexes)
+          })
+
+      is_degraded = len(unloaded_collections) > 0 or len(unindexed_collections) > 0
+
+      if unloaded_collections:
+          status = "CRITICAL_COLLECTION_UNLOADED"
+          runbook = (
+              f"Collections offline from query engine: {unloaded_collections}. "
+              "1. Execute 'client.load_collection()' to load segments into memory. "
+              "2. Verify query node memory quotas and cluster capacity."
+          )
+      elif unindexed_collections:
+          status = "WARNING_UNINDEXED_VECTORS"
+          runbook = (
+              f"Collections missing vector index: {unindexed_collections}. "
+              "Similarity queries will fall back to slow flat scans. "
+              "Create an HNSW or AUTOINDEX index on vector fields."
+          )
+      else:
+          status = "HEALTHY"
+          runbook = "All collections loaded into query memory with active vector indexes."
+
+      Kestra.outputs({
+          "total_collections": total_collections,
+          "unloaded_count": len(unloaded_collections),
+          "unindexed_count": len(unindexed_collections),
+          "unloaded_summary": ", ".join(unloaded_collections) if unloaded_collections else "None",
+          "unindexed_summary": ", ".join(unindexed_collections) if unindexed_collections else "None",
+          "is_degraded": is_degraded,
+          "status": status,
+          "runbook": runbook
+      })
+
+  - id: evaluate_vector_health
+    type: io.kestra.plugin.core.flow.If
+    description: "Evaluates whether any collections are unloaded from memory or missing vector indexes"
+    condition: "{{ outputs.audit_milvus_collections.vars.is_degraded == true }}"
+    then:
+      - id: notify_slack_milvus_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: "Dispatches high-urgency alert to Slack with collection names and remediation runbooks"
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "{{ inputs.slack_channel }}",
+            "text": "⚠️ *MILVUS VECTOR DATABASE INTEGRITY ALERT*\n*Status:* `{{ outputs.audit_milvus_collections.vars.status }}`\n*Target:* `{{ inputs.milvus_host }}:{{ inputs.milvus_port }}`\n*Total Collections:* {{ outputs.audit_milvus_collections.vars.total_collections }}\n*Unloaded Collections:* {{ outputs.audit_milvus_collections.vars.unloaded_summary }}\n*Unindexed Collections:* {{ outputs.audit_milvus_collections.vars.unindexed_summary }}\n*Runbook Action:* {{ outputs.audit_milvus_collections.vars.runbook }}\n*Execution:* `{{ execution.id }}`"
+          }
+
+    else:
+      - id: log_healthy_vector_store
+        type: io.kestra.plugin.core.log.Log
+        description: "Logs verified healthy collection state when all vectors are loaded and indexed"
+        message: "Milvus cluster at {{ inputs.milvus_host }}:{{ inputs.milvus_port }} is healthy. All {{ outputs.audit_milvus_collections.vars.total_collections }} collections are fully loaded and indexed."
+
+  - id: finalize_vector_telemetry
+    type: io.kestra.plugin.core.output.OutputValues
+    description: "Publishes final structured telemetry for audit history and RAG health monitoring"
+    values:
+      execution_id: "{{ execution.id }}"
+      target: "{{ inputs.milvus_host }}"
+      total_collections: "{{ outputs.audit_milvus_collections.vars.total_collections }}"
+      unloaded_count: "{{ outputs.audit_milvus_collections.vars.unloaded_count }}"
+      unindexed_count: "{{ outputs.audit_milvus_collections.vars.unindexed_count }}"
+      status: "{{ outputs.audit_milvus_collections.vars.status }}"
+
+errors:
+  - id: notify_probe_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: "Alerts SRE team if the Milvus REST API endpoint is unreachable"
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "channel": "{{ inputs.slack_channel }}",
+        "text": "🚨 *MILVUS SENTINEL PROBE FAILED*\n*Target:* `{{ inputs.milvus_host }}:{{ inputs.milvus_port }}`\n*Failure:* Sentinel was unable to connect to Milvus REST API `/v2/vectordb/collections/list`.\n*Execution ID:* `{{ execution.id }}`\n*Flow:* `{{ flow.id }}`"
+      }
+
+extend:
+  title: Milvus Vector Database Collection Index and Load State Sentinel
+  metaTitle: Milvus Vector Database Collection Index and Load State Sentinel
+  shortDescription: Audits Milvus vector collections for unindexed embeddings and unloaded memory states via REST API, alerting Slack.
+  metaDescription: Audits Milvus vector database collections for unindexed embeddings and unloaded query states, routing alerts and rebuild runbooks to Slack.
+  description: |
+    Milvus is a distributed, high-performance open-source vector database built for GenAI, retrieval-augmented generation (RAG), and similarity search. When embeddings are streamed into collections, vectors reside in growing unindexed segments until index building completes (e.g. HNSW, IVF_FLAT, or AUTOINDEX). Furthermore, collections must be explicitly loaded into query node RAM (`load_state: Loaded`) to serve search queries.
+
+    If an index fails to build or a collection remains unloaded, similarity searches degrade into brute-force flat scans or fail with query rejection errors. This blueprint provides continuous vector database surveillance by querying Milvus's native v2 REST API, checking indexing status and memory load states across all collections, and routing actionable SRE runbook alerts to Slack before retrieval latency impacts production AI applications.
+
+    ## How it works
+
+    1. **Scheduled Audit**: The `periodic_vector_index_audit` trigger (`io.kestra.plugin.core.trigger.Schedule`) initiates a vector collection scan every two hours.
+    2. **Collection State Inspection**: The `audit_milvus_collections` task (`io.kestra.plugin.scripts.python.Script` inside Docker) calls Milvus v2 REST API endpoints (`/v2/vectordb/collections/list` and `/v2/vectordb/collections/describe`), checking memory load states (`Loaded` vs `NotLoad`) and inspecting active index configurations.
+    3. **Threshold Gate**: The `evaluate_vector_health` task (`io.kestra.plugin.core.flow.If`) evaluates collection integrity:
+       - **Degraded Path**: Dispatches a high-urgency Slack incident card via `notify_slack_milvus_alert` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`) specifying unloaded collections, unindexed embedding sets, and recovery runbooks.
+       - **Healthy Path**: Records healthy collection confirmation in execution logs via `log_healthy_vector_store` (`io.kestra.plugin.core.log.Log`).
+    4. **Telemetry Export**: The `finalize_vector_telemetry` task (`io.kestra.plugin.core.output.OutputValues`) exposes clean outputs for observability dashboards and audit compliance.
+    5. **Pipeline Resilience**: An `errors` handler (`notify_probe_failure`) ensures immediate Slack alerting if the Milvus REST API is unreachable, network connectivity drops, or authentication fails.
+
+    ## What you get
+
+    - Early detection of unindexed vector sets before similarity search queries experience latency spikes.
+    - Automated detection of unloaded collections that would fail user-facing RAG retrieval pipelines.
+    - Direct Slack notifications enriched with collection names and `load_collection` runbooks.
+    - Complete execution audit history in Kestra.
+
+    ## Who it's for
+
+    - AI Platform Engineers and MLOps teams managing production Milvus vector databases for LLMs.
+    - Site Reliability Engineers (SREs) maintaining high-availability vector search clusters.
+    - Data Engineers deploying real-time embedding pipelines for retrieval-augmented generation.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra coordinates recurring cron schedules, isolated containerized script execution, conditional evaluation logic, and enterprise Slack webhooks into a unified, auditable execution graph. If a query fails or network connectivity drops, Kestra captures complete execution logs and executes automated fallback alerts without requiring custom monitoring daemons.
+
+    ## Prerequisites
+
+    - A running Milvus standalone or distributed cluster with HTTP REST API access (default port 19530).
+    - A Slack Incoming Webhook URL configured with permission to post to the alert channel.
+    - Docker enabled on Kestra workers to run the Python script container.
+
+    ### Secrets
+
+    - `SLACK_WEBHOOK_URL`: Incoming Webhook URL for the target Slack workspace.
+    - `MILVUS_TOKEN`: (Optional) API key or Bearer token for authenticated Milvus clusters.
+
+    ## Quick start
+
+    1. Store your `SLACK_WEBHOOK_URL` and `MILVUS_TOKEN` in your Kestra namespace secrets.
+    2. Import this blueprint into your Kestra workspace under namespace `company.ai`.
+    3. Trigger a manual execution with your Milvus endpoint to verify connectivity and telemetry outputs.
+    4. Enable the `periodic_vector_index_audit` trigger to start continuous 2-hour vector database surveillance.
+
+    ## How to extend
+
+    - Add automated remediation: execute `client.load_collection()` automatically inside the `then` branch to recover unloaded collections.
+    - Integrate with PagerDuty for critical vector search outages where production collections are completely unloaded.
+    - Query vector row counts to identify rapid dataset growth before memory quotas are breached.
+
+    ## Links
+
+    - [Milvus v2 REST API Overview](https://milvus.io/docs/v2.4.x/restful_overview.md)
+    - [Kestra Python Script Documentation](https://kestra.io/plugins/plugin-scripts-python/io.kestra.plugin.scripts.python.script)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [Milvus Indexing & Load Overview](https://milvus.io/docs/index.md)
+    - This blueprint has been created by [Pranjulchaurasiya](https://github.com/Pranjulchaurasiya)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - DevOps & CI/CD
+  ee: false
+  demo: false
